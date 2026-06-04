@@ -75,7 +75,7 @@ jobs:
            # TARGETS THE EXACT COMPREHENSIVE ZIP MASTER ARCHIVE LINK
            curl.exe -L -o tiny11.zip https://github.com/ntdevlabs/tiny11builder/archive/refs/heads/main.zip
            tar -xf tiny11.zip
-           Get-ChildItem -Path "tiny11builder-main\*" | Move-Item -Destination .
+           Copy-Item -Path "tiny11builder-main\*" -Destination . -Recurse -Force
            Remove-Item -Path "tiny11builder-main" -Recurse -Force
            Remove-Item -Path "tiny11.zip"
 
