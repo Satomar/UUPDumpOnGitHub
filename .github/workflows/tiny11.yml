@@ -54,15 +54,11 @@ jobs:
             }
 
             if (-not $directDownloadUrl) {
-              throw @"
-GoFile API returned error-notFound. The API now requires account authentication.
-
-Workaround: open $url in your browser, right-click the download button,
-select "Copy Link Address", and re-run the workflow with that direct URL.
-
-Direct URLs look like:
-  https://store-eu-par-2.gofile.io/download/web/<id>/<filename.iso>
-"@
+              $msg = "GoFile API returned error-notFound. The API now requires account authentication. " +
+                     "Open $url in your browser, right-click the download button, " +
+                     "select 'Copy Link Address', and re-run with that direct URL. " +
+                     "Direct URLs look like: https://store-*.gofile.io/download/web/<id>/<filename.iso>"
+              throw $msg
             }
           } else {
             # Direct download URL: use as-is
