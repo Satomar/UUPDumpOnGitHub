@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
         gofile_url:
-            description: 'Enter your full GoFile link (e.g., https://gofile.io)'
+            description: 'GoFile page URL (https://gofile.io/d/xxx) OR direct download URL (https://store-*.gofile.io/download/web/...) — right-click download button in browser, Copy Link Address'
             required: true
             type: string
 
@@ -18,90 +18,133 @@ jobs:
       - name: Fetching ISO from GoFile
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
           $url = "${{ inputs.gofile_url }}"
-          # Extract content ID from URL like https://gofile.io/d/aJ44DJ
-          $gofileId = ($url -split '/')[-1]
 
-          Write-Output "Resolving GoFile API for content ID: $gofileId"
-          $apiResponse = Invoke-RestMethod -Uri "https://api.gofile.io/getContent?contentId=$gofileId"
+          # Check if this is a GoFile page URL or a direct download URL
+          if ($url -match 'gofile\.io/d/') {
+            # GoFile page URL: fetch page to get cookies, then call API
+            $gofileId = ($url -split '/')[-1]
+            Write-Output "Resolving GoFile page for content ID: $gofileId"
 
-          if ($apiResponse.status -ne "ok") {
-             throw "Failed to resolve GoFile download link. Status: $($apiResponse.status). Ensure the link is valid and not expired."
+            # Create session to capture cookies like a browser would
+            $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+            try {
+              $null = Invoke-WebRequest -Uri $url -WebSession $session `
+                -UseBasicParsing -TimeoutSec 30 `
+                -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            } catch {
+              Write-Warning "Page fetch failed (non-fatal): $_"
+            }
+
+            # Try API with session cookies
+            try {
+              $apiResponse = Invoke-RestMethod `
+                -Uri "https://api.gofile.io/getContent?contentId=$gofileId" `
+                -WebSession $session
+              if ($apiResponse.status -eq "ok") {
+                $files = $apiResponse.data.contents.PSObject.Properties.Value
+                if ($files) {
+                  $directDownloadUrl = $files[0].link
+                  Write-Output "Resolved via API: $($files[0].name)"
+                }
+              }
+            } catch {
+              Write-Warning "API resolution failed: $_"
+            }
+
+            if (-not $directDownloadUrl) {
+              throw @"
+GoFile API returned error-notFound. The API now requires account authentication.
+
+Workaround: open $url in your browser, right-click the download button,
+select "Copy Link Address", and re-run the workflow with that direct URL.
+
+Direct URLs look like:
+  https://store-eu-par-2.gofile.io/download/web/<id>/<filename.iso>
+"@
+            }
+          } else {
+            # Direct download URL: use as-is
+            $directDownloadUrl = $url
+            Write-Output "Using direct download URL"
           }
 
-          # contents is a dictionary keyed by file ID — enumerate values to get the first file
-          $files = $apiResponse.data.contents.PSObject.Properties.Value
-          if (-not $files) {
-             throw "No files found in GoFile content link."
-          }
-          $directDownloadUrl = $files[0].link
-          Write-Output "Downloading ISO: $($files[0].name)"
           Write-Output "Direct URL: $directDownloadUrl"
-
           Invoke-WebRequest -Uri $directDownloadUrl -OutFile "input.iso"
 
       - name: Fetching Tiny11 Builder Script
+        shell: pwsh
         run: |
            # TARGETS THE EXACT COMPREHENSIVE ZIP MASTER ARCHIVE LINK
-           curl -L -o tiny11.zip https://github.com/ntdevlabs/tiny11builder/archive/refs/heads/main.zip
+           curl.exe -L -o tiny11.zip https://github.com/ntdevlabs/tiny11builder/archive/refs/heads/main.zip
            tar -xf tiny11.zip
            Get-ChildItem -Path "tiny11builder-main\*" | Move-Item -Destination .
            Remove-Item -Path "tiny11builder-main" -Recurse -Force
            Remove-Item -Path "tiny11.zip"
 
       - name: Executing Tiny11 Debloat Logic
+        timeout-minutes: 180
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
           $baseIso = Get-ChildItem "input.iso" | Select-Object -First 1
           if (-not $baseIso) { throw "Target image file resolution failed." }
-          
+
           # 1. Mount the original UUP ISO
           Write-Output "Mounting your baseline ISO: $($baseIso.Name)"
           $mountDrive = (Mount-DiskImage -ImagePath $baseIso.FullName -PassThru | Get-Volume).DriveLetter
-          
-          # 2. Prepare an isolated scratch/working folder directory
-          mkdir C:\scratch_dir
-          
+
+          # 2. Prepare isolated scratch directory
+          $scratchDir = Join-Path $env:RUNNER_TEMP scratch_dir
+          New-Item -ItemType Directory -Path $scratchDir -Force | Out-Null
+          Write-Output "Scratch directory: $scratchDir"
+
           # 3. Loosen execution constraints to let PowerShell run tiny11maker
           Set-ExecutionPolicy Bypass -Scope Process -Force
-          
-          # 4. Modifying default autounattend answer configuration profile
-          # Removes the local account bypass rules so standard Microsoft Account registration is kept intact
+
+          # 4. Modify default autounattend answer configuration profile
+          # Remove local account bypass rules so Microsoft Account registration stays intact
           if (Test-Path .\autounattend.xml) {
-             (Get-Content .\autounattend.xml) |
-             Where-Object { $_ -notmatch 'OOBE\\BypassNRO' } |
-             Set-Content .\autounattend.xml
-             # NOTE: 'OOBE\\BypassNRO' in single-quoted string = literal double backslash.
-             # If intended pattern is single backslash, change to -notmatch 'OOBE\BypassNRO'
+             $xml = (Get-Content .\autounattend.xml) |
+                    Where-Object { $_ -notmatch 'OOBE\\BypassNRO' }
+             $xml | Set-Content .\autounattend.xml
           }
-          
-          # 5. Run the script using the official parameter flags
+
+          # 5. Run tiny11maker with official parameter flags
           Write-Output "Executing tiny11maker.ps1 using Mount Drive $mountDrive"
-          .\tiny11maker.ps1 -ISO $mountDrive -SCRATCH C:\scratch_dir
-          
-          # 6. Safely unmount volume allocations and clean up workspace folders
+          .\tiny11maker.ps1 -ISO $mountDrive -SCRATCH $scratchDir
+
+          # 6. Safely unmount volume allocations and clean up
           Dismount-DiskImage -ImagePath $baseIso.FullName
-          del $baseIso.FullName
-          Remove-Item -Recurse -Force C:\scratch_dir
-          
-          # 7. Rename output compilation parameters
+          Remove-Item $baseIso.FullName -Force
+          Remove-Item -Recurse -Force $scratchDir
+
+          # 7. Rename output
           if (Test-Path .\tiny11.iso) {
              Rename-Item -Path .\tiny11.iso -NewName "Debloated_Windows11_23H2.iso"
           } else {
              throw "Tiny11 engine failed to output a modified ISO."
           }
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
       - name: Create WebSeeded Torrent & Upload
         shell: powershell
         run: |
-          # 1. Install Node.js torrent creation framework
+          $ErrorActionPreference = 'Stop'
+
+          # 1. Install torrent creation tool
           npm install -g create-torrent
 
           # 2. Locate the final debloated output ISO
           $isoFile = Get-ChildItem "Debloated_Windows11_23H2.iso" | Select-Object -First 1
           if (-not $isoFile) { throw "Final output ISO file target missing." }
 
-          # 3. Upload ISO to GoFile (PowerShell-native, CI-safe — no pause like upload.cmd)
+          # 3. Upload ISO to GoFile
           Write-Output "Resolving GoFile upload server..."
           $servers = Invoke-RestMethod -Uri "https://api.gofile.io/servers"
           $server = $servers.data.servers[0].name
@@ -118,7 +161,13 @@ jobs:
           $downloadPage = $uploadResult.data.downloadPage
           Write-Output "GoFile download page: $downloadPage"
 
-          # 4. Resolve download page → direct download URL for webseed
+          # Save the download page link as fallback artifact
+          $downloadPage | Out-File -FilePath gofile_link.txt -Encoding utf8
+
+          # Write to step summary so link is visible in the run log
+          "## GoFile Download Link`n$downloadPage" >> $env:GITHUB_STEP_SUMMARY
+
+          # 4. Resolve download page -> direct download URL for webseed
           $contentId = ($downloadPage -split '/')[-1]
           $contentResponse = Invoke-RestMethod -Uri "https://api.gofile.io/getContent?contentId=$contentId"
           if ($contentResponse.status -ne "ok") {
@@ -137,5 +186,11 @@ jobs:
       - name: Upload Output Torrent Descriptor
         uses: actions/upload-artifact@v4
         with:
-          name: windows_debloated_torrent
+          name: windows_debloated_torrent_${{ github.run_id }}
           path: output.torrent
+
+      - name: Upload GoFile Download Link
+        uses: actions/upload-artifact@v4
+        with:
+          name: gofile_download_link_${{ github.run_id }}
+          path: gofile_link.txt
