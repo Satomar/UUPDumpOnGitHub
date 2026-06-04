@@ -1,0 +1,141 @@
+name: GoFile Torrent Tiny11 Debloat
+
+on:
+  workflow_dispatch:
+    inputs:
+        gofile_url:
+            description: 'Enter your full GoFile link (e.g., https://gofile.io)'
+            required: true
+            type: string
+
+jobs:
+  process_iso:
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetching ISO from GoFile
+        shell: powershell
+        run: |
+          $url = "${{ inputs.gofile_url }}"
+          # Extract content ID from URL like https://gofile.io/d/aJ44DJ
+          $gofileId = ($url -split '/')[-1]
+
+          Write-Output "Resolving GoFile API for content ID: $gofileId"
+          $apiResponse = Invoke-RestMethod -Uri "https://api.gofile.io/getContent?contentId=$gofileId"
+
+          if ($apiResponse.status -ne "ok") {
+             throw "Failed to resolve GoFile download link. Status: $($apiResponse.status). Ensure the link is valid and not expired."
+          }
+
+          # contents is a dictionary keyed by file ID — enumerate values to get the first file
+          $files = $apiResponse.data.contents.PSObject.Properties.Value
+          if (-not $files) {
+             throw "No files found in GoFile content link."
+          }
+          $directDownloadUrl = $files[0].link
+          Write-Output "Downloading ISO: $($files[0].name)"
+          Write-Output "Direct URL: $directDownloadUrl"
+
+          Invoke-WebRequest -Uri $directDownloadUrl -OutFile "input.iso"
+
+      - name: Fetching Tiny11 Builder Script
+        run: |
+           # TARGETS THE EXACT COMPREHENSIVE ZIP MASTER ARCHIVE LINK
+           curl -L -o tiny11.zip https://github.com/ntdevlabs/tiny11builder/archive/refs/heads/main.zip
+           tar -xf tiny11.zip
+           Get-ChildItem -Path "tiny11builder-main\*" | Move-Item -Destination .
+           Remove-Item -Path "tiny11builder-main" -Recurse -Force
+           Remove-Item -Path "tiny11.zip"
+
+      - name: Executing Tiny11 Debloat Logic
+        shell: powershell
+        run: |
+          $baseIso = Get-ChildItem "input.iso" | Select-Object -First 1
+          if (-not $baseIso) { throw "Target image file resolution failed." }
+          
+          # 1. Mount the original UUP ISO
+          Write-Output "Mounting your baseline ISO: $($baseIso.Name)"
+          $mountDrive = (Mount-DiskImage -ImagePath $baseIso.FullName -PassThru | Get-Volume).DriveLetter
+          
+          # 2. Prepare an isolated scratch/working folder directory
+          mkdir C:\scratch_dir
+          
+          # 3. Loosen execution constraints to let PowerShell run tiny11maker
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          
+          # 4. Modifying default autounattend answer configuration profile
+          # Removes the local account bypass rules so standard Microsoft Account registration is kept intact
+          if (Test-Path .\autounattend.xml) {
+             (Get-Content .\autounattend.xml) |
+             Where-Object { $_ -notmatch 'OOBE\\BypassNRO' } |
+             Set-Content .\autounattend.xml
+             # NOTE: 'OOBE\\BypassNRO' in single-quoted string = literal double backslash.
+             # If intended pattern is single backslash, change to -notmatch 'OOBE\BypassNRO'
+          }
+          
+          # 5. Run the script using the official parameter flags
+          Write-Output "Executing tiny11maker.ps1 using Mount Drive $mountDrive"
+          .\tiny11maker.ps1 -ISO $mountDrive -SCRATCH C:\scratch_dir
+          
+          # 6. Safely unmount volume allocations and clean up workspace folders
+          Dismount-DiskImage -ImagePath $baseIso.FullName
+          del $baseIso.FullName
+          Remove-Item -Recurse -Force C:\scratch_dir
+          
+          # 7. Rename output compilation parameters
+          if (Test-Path .\tiny11.iso) {
+             Rename-Item -Path .\tiny11.iso -NewName "Debloated_Windows11_23H2.iso"
+          } else {
+             throw "Tiny11 engine failed to output a modified ISO."
+          }
+
+      - name: Create WebSeeded Torrent & Upload
+        shell: powershell
+        run: |
+          # 1. Install Node.js torrent creation framework
+          npm install -g create-torrent
+
+          # 2. Locate the final debloated output ISO
+          $isoFile = Get-ChildItem "Debloated_Windows11_23H2.iso" | Select-Object -First 1
+          if (-not $isoFile) { throw "Final output ISO file target missing." }
+
+          # 3. Upload ISO to GoFile (PowerShell-native, CI-safe — no pause like upload.cmd)
+          Write-Output "Resolving GoFile upload server..."
+          $servers = Invoke-RestMethod -Uri "https://api.gofile.io/servers"
+          $server = $servers.data.servers[0].name
+          if (-not $server) { throw "Failed to resolve GoFile upload server." }
+
+          Write-Output "Uploading $($isoFile.Name) to $server.gofile.io..."
+          $uploadResult = Invoke-RestMethod -Uri "https://${server}.gofile.io/uploadFile" `
+            -Method Post -Form @{ file = Get-Item $isoFile.Name }
+          if ($uploadResult.status -ne "ok") {
+            throw "GoFile upload failed. Status: $($uploadResult.status)"
+          }
+
+          # uploadResult.data.downloadPage = https://gofile.io/d/xxxxx
+          $downloadPage = $uploadResult.data.downloadPage
+          Write-Output "GoFile download page: $downloadPage"
+
+          # 4. Resolve download page → direct download URL for webseed
+          $contentId = ($downloadPage -split '/')[-1]
+          $contentResponse = Invoke-RestMethod -Uri "https://api.gofile.io/getContent?contentId=$contentId"
+          if ($contentResponse.status -ne "ok") {
+            throw "Failed to resolve direct download URL. Status: $($contentResponse.status)"
+          }
+          $directUrl = $contentResponse.data.contents.PSObject.Properties.Value[0].link
+          Write-Output "Direct webseed URL: $directUrl"
+
+          # 5. Create torrent with GoFile direct link as webseed
+          create-torrent $isoFile.Name --urlList $directUrl --output output.torrent
+
+          Write-Output "=========================================================="
+          Write-Output "TORRENT METADATA MAP SUCCESSFULLY GENERATED VIA WEBSEED"
+          Write-Output "=========================================================="
+
+      - name: Upload Output Torrent Descriptor
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows_debloated_torrent
+          path: output.torrent
