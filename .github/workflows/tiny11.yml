@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
         gofile_url:
-            description: 'GoFile page URL (https://gofile.io/d/xxx) OR direct download URL (https://store-*.gofile.io/download/web/...) — right-click download button in browser, Copy Link Address'
+            description: 'GoFile page URL (https://gofile.io/d/xxx) or direct download URL from browser (right-click download button → Copy Link Address)'
             required: true
             type: string
 
@@ -21,32 +21,47 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $url = "${{ inputs.gofile_url }}"
 
-          # Check if this is a GoFile page URL or a direct download URL
           if ($url -match 'gofile\.io/d/') {
-            # GoFile page URL: fetch page to get cookies, then call API
-            $gofileId = ($url -split '/')[-1]
-            Write-Output "Resolving GoFile page for content ID: $gofileId"
+            # GoFile page URL — resolve via API with guest account
+            $contentId = ($url -split '/')[-1]
+            Write-Output "Resolving GoFile content ID: $contentId"
 
-            # Create session to capture cookies like a browser would
-            $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
-            try {
-              $null = Invoke-WebRequest -Uri $url -WebSession $session `
-                -UseBasicParsing -TimeoutSec 30 `
-                -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            } catch {
-              Write-Warning "Page fetch failed (non-fatal): $_"
+            # Step 1: Create anonymous guest account
+            Write-Output "Creating guest account..."
+            $guestResp = Invoke-RestMethod -Uri "https://api.gofile.io/accounts" -Method Post
+            if ($guestResp.status -ne "ok") {
+              throw "Failed to create GoFile guest account: $($guestResp.status)"
             }
+            $token = $guestResp.data.token
+            Write-Output "Guest token: $token"
 
-            # Try API with session cookies
+            # Step 2: Compute X-Website-Token = SHA256(platform::language::token::timestamp::constant)
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            $platform = "Win32"
+            $language = (Get-Culture).Name  # e.g. "en-US"
+            $ts = [Math]::Floor([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() / 3840).ToString()
+            $constant = "4fd6sg89d7s6"  # from config.js
+            $wtInput = "${platform}::${language}::${token}::${ts}::${constant}"
+            Write-Output "WT input: $wtInput"
+            $wtHash = [System.BitConverter]::ToString(
+              $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($wtInput))
+            ).Replace("-", "").ToLower()
+            Write-Output "WT: $wtHash"
+
+            # Step 3: Resolve content URL via API
             try {
-              $apiResponse = Invoke-RestMethod `
-                -Uri "https://api.gofile.io/getContent?contentId=$gofileId" `
-                -WebSession $session
-              if ($apiResponse.status -eq "ok") {
-                $files = $apiResponse.data.contents.PSObject.Properties.Value
-                if ($files) {
-                  $directDownloadUrl = $files[0].link
-                  Write-Output "Resolved via API: $($files[0].name)"
+              $apiResp = Invoke-RestMethod `
+                -Uri "https://api.gofile.io/contents/$contentId" `
+                -Headers @{
+                  "Authorization" = "Bearer $token"
+                  "X-Website-Token" = $wtHash
+                  "X-BL" = $language
+                }
+              if ($apiResp.status -eq "ok") {
+                $file = $apiResp.data.children.PSObject.Properties.Value | Select-Object -First 1
+                if ($file -and $file.link) {
+                  $directDownloadUrl = $file.link
+                  Write-Output "Resolved: $($file.name)"
                 }
               }
             } catch {
@@ -54,20 +69,29 @@ jobs:
             }
 
             if (-not $directDownloadUrl) {
-              $msg = "GoFile API returned error-notFound. The API now requires account authentication. " +
-                     "Open $url in your browser, right-click the download button, " +
-                     "select 'Copy Link Address', and re-run with that direct URL. " +
-                     "Direct URLs look like: https://store-*.gofile.io/download/web/<id>/<filename.iso>"
+              $msg = "GoFile API failed to resolve content. Either a premium account is required, " +
+                     "or the API changed. Workaround: open $url in Chrome, right-click the download " +
+                     "button -> Copy Link Address, and re-run with that direct URL."
               throw $msg
             }
           } else {
-            # Direct download URL: use as-is
+            # Direct download URL from browser
             $directDownloadUrl = $url
             Write-Output "Using direct download URL"
           }
 
-          Write-Output "Direct URL: $directDownloadUrl"
-          Invoke-WebRequest -Uri $directDownloadUrl -OutFile "input.iso"
+          Write-Output "Downloading: $directDownloadUrl"
+          Invoke-WebRequest -Uri $directDownloadUrl `
+            -OutFile "input.iso" `
+            -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+          # Validate: real ISO is 4+ GB, error page is < 1 MB
+          $fileSize = (Get-Item "input.iso").Length
+          if ($fileSize -lt 1GB) {
+            $sizeMB = [math]::Round($fileSize / 1MB, 2)
+            throw "Downloaded file is only $sizeMB MB — likely an error page, not an ISO. The GoFile direct URL may have expired. Get a fresh direct URL from Chrome (right-click download button -> Copy Link Address) and re-run."
+          }
+          Write-Output "Downloaded: $([math]::Round($fileSize / 1GB, 2)) GB"
 
       - name: Fetching Tiny11 Builder Script
         shell: pwsh
