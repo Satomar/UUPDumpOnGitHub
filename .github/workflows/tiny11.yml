@@ -89,7 +89,7 @@ jobs:
           $fileSize = (Get-Item "input.iso").Length
           if ($fileSize -lt 1GB) {
             $sizeMB = [math]::Round($fileSize / 1MB, 2)
-            throw "Downloaded file is only $sizeMB MB — likely an error page, not an ISO. The GoFile direct URL may have expired. Get a fresh direct URL from Chrome (right-click download button -> Copy Link Address) and re-run."
+            throw "Downloaded file is only $sizeMB MB -- likely an error page, not an ISO. The GoFile direct URL may have expired. Get a fresh direct URL from Chrome (right-click download button -> Copy Link Address) and re-run."
           }
           Write-Output "Downloaded: $([math]::Round($fileSize / 1GB, 2)) GB"
 
